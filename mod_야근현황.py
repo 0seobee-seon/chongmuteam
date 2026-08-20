@@ -270,6 +270,17 @@ def _is_formula(cell_value):
 
 
 def _extract_formula_templates(ws, date_start_col, num_days):
+    """템플릿 시트의 성명행 야근 수식을 행번호 독립 템플릿으로 뽑는다.
+
+    데이터행 참조만 '{ROW}' 로 치환한다. 예전에는 수식 전체를
+    str.replace(str(data_row), '{ROW}') 로 바꿨는데, 그러면 수식 안의
+    숫자 리터럴까지 함께 잡혔다. 예를 들어 data_row 가 10 이면
+    INT(F10/100) 이 INT(F{ROW}/{ROW}0) 이 되고, 이 템플릿이 fallback 으로
+    다른 행에 적용되면 /100 이 /120 처럼 깨진 수식이 만들어졌다.
+
+    _shift_formula_rows 는 셀 참조의 행번호만 건드리므로(절대행 $6 ·
+    명명범위 · 함수명 제외) 리터럴이 오염되지 않는다.
+    """
     per_row = {}
     fallback = {}
     for row in range(7, 80, 2):
@@ -281,7 +292,7 @@ def _extract_formula_templates(ws, date_start_col, num_days):
             col = date_start_col + 2 * d_off
             v = ws.cell(row, col).value
             if _is_formula(v):
-                row_tmpl[d_off] = v.replace(str(data_row), '{ROW}')
+                row_tmpl[d_off] = _shift_formula_rows(v, {data_row: '{ROW}'})
         if row_tmpl:
             per_row[row] = row_tmpl
             if not fallback:
@@ -345,6 +356,161 @@ def clear_period_cells(ws, date_start_col, form_start, eff_start, eff_end,
                     if protect_text and isinstance(cell.value, str):
                         continue
                     cell.value = None
+
+
+# ── 출퇴근 데이터 초기화 ──────────────────────────────────────────────
+# 양식의 일자 칸은 하루당 2열(출근/퇴근)이며, 책정기간이 30일인 달에도
+# 31일치 칸이 만들어져 있다. 초기화는 책정기간이 아니라 '시트에 실재하는
+# 일자 칸 전체'를 대상으로 해야 지난달 31일차 잔여 데이터까지 지워진다.
+def count_day_slots(ws, date_start_col, max_slots=40):
+    """3행의 날짜 셀만 2열 간격으로 센다.
+
+    일자 칸 오른쪽에는 '평일야근', '보상휴가' 같은 요약 열이 이어진다.
+    그 헤더는 일반 텍스트이므로, 날짜(datetime) 또는 날짜 수식만 인정해야
+    요약 열을 일자 칸으로 잘못 세지 않는다.
+    """
+    n = 0
+    for i in range(max_slots):
+        v = ws.cell(3, date_start_col + 2 * i).value
+        if isinstance(v, datetime) or _is_formula(v):
+            n += 1
+            continue
+        break
+    return n
+
+
+# 수식의 셀 참조 행번호만 옮긴다. 절대행($6)·명명범위(야근시작)·
+# 함수명(LOG10 처럼 뒤에 '(' 가 오는 것)은 건드리지 않는다.
+_CELL_REF_RE = re.compile(r'(?<![A-Za-z0-9_.$!])(\$?)([A-Z]{1,3})(\$?)(\d+)(?![\d(])')
+
+
+def _shift_formula_rows(formula, row_map):
+    def repl(m):
+        d1, col, d2, row = m.groups()
+        if d2 == '$':
+            return m.group(0)
+        return f"{d1}{col}{d2}{row_map.get(int(row), int(row))}"
+    return _CELL_REF_RE.sub(repl, formula)
+
+
+def find_daycell_formula_donor(ws, date_start_col, num_slots):
+    """성명행 중 날짜칸 수식이 가장 온전한 행을 골라 (행번호, {칸번호: 수식})."""
+    best_row, best_tmpl = None, {}
+    for row in range(7, 80, 2):
+        tmpl = {}
+        for i in range(num_slots):
+            v = ws.cell(row, date_start_col + 2 * i).value
+            if _is_formula(v):
+                tmpl[i] = v
+        if len(tmpl) > len(best_tmpl):
+            best_row, best_tmpl = row, tmpl
+    return best_row, best_tmpl
+
+
+def restore_daycell_formulas(ws, date_start_col, num_slots, employee_rules=None):
+    """같은 시트의 온전한 행에서 야근 계산 수식을 복사해 빈 성명행에 채운다.
+
+    별도 템플릿 파일 없이 시트 내부만으로 복원하므로, 수기 작업 중
+    수식이 값으로 덮인 행을 그 자리에서 되살릴 수 있다.
+    """
+    donor_row, tmpl = find_daycell_formula_donor(ws, date_start_col, num_slots)
+    if not tmpl:
+        return 0, None
+    donor_data = donor_row + 1
+    restored = 0
+    for row in range(7, 80, 2):
+        if row == donor_row:
+            continue
+        name = ws.cell(row, 3).value
+        if not name:
+            continue
+        data_row = row + 1
+        row_map = {donor_row: row, donor_data: data_row}
+        for i, f in tmpl.items():
+            cell = ws.cell(row, date_start_col + 2 * i)
+            if _is_formula(cell.value):
+                continue
+            new_f = _shift_formula_rows(f, row_map)
+            new_f = _apply_employee_rule(new_f, str(name), employee_rules or {})
+            cell.value = new_f
+            restored += 1
+    return restored, donor_row
+
+
+def clear_attendance_cells(ws, date_start_col, num_slots, clear_reason=False):
+    """데이터행의 출근/퇴근 값을 비운다. 수식은 모두 보존한다.
+
+    성명행에 남은 '수식이 아닌 값'(수식이 값으로 덮인 흔적)도 함께 지운다.
+    이 값을 남기면 출퇴근을 지운 뒤에도 옛 야근시간이 표시돼 버린다.
+    """
+    cleared_data = 0
+    cleared_stale = 0
+    for row in range(7, 80):
+        is_name_row = (row % 2 == 1)
+        for i in range(num_slots):
+            col_in = date_start_col + 2 * i
+            if is_name_row:
+                cell = ws.cell(row, col_in)
+                if cell.value is not None and not _is_formula(cell.value):
+                    cell.value = None
+                    cleared_stale += 1
+            else:
+                for col in (col_in, col_in + 1):
+                    cell = ws.cell(row, col)
+                    if cell.value is None or _is_formula(cell.value):
+                        continue
+                    if not clear_reason and isinstance(cell.value, str):
+                        continue
+                    cell.value = None
+                    cleared_data += 1
+    return cleared_data, cleared_stale
+
+
+def process_clear_file(path, output_dir, log_fn, clear_reason=False,
+                       do_restore=True, overwrite=False, employee_rules=None):
+    log_fn(f"\n▶ 초기화: {os.path.basename(path)}")
+    wb = load_workbook(path)
+    processed = 0
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        if not is_overtime_sheet(ws):
+            log_fn(f"    [{sheet_name}] 스킵 (양식 아님)")
+            continue
+
+        _, dsc = detect_form_layout(ws)
+        num_slots = count_day_slots(ws, dsc)
+        if num_slots == 0:
+            log_fn(f"    [{sheet_name}] ⚠ 일자 칸을 찾지 못함 — 건너뜀")
+            continue
+
+        cd, cs = clear_attendance_cells(ws, dsc, num_slots, clear_reason)
+        log_fn(f"    [{sheet_name}] 일자 칸 {num_slots}개 · 출퇴근 {cd}셀 삭제"
+               + ("" if clear_reason else "  [사유 텍스트 보호]"))
+        if cs:
+            log_fn(f"    [{sheet_name}]   └ 성명행에 값으로 덮여있던 야근시간 {cs}셀 제거")
+
+        if do_restore:
+            n, donor = restore_daycell_formulas(ws, dsc, num_slots, employee_rules)
+            if n:
+                log_fn(f"    [{sheet_name}]   └ 야근 계산 수식 복원 {n}셀 (기준 행 {donor})")
+            elif cs:
+                log_fn(f"    [{sheet_name}]   ⚠ 수식 복원 실패 — 시트에 온전한 수식 행이 없음")
+
+        processed += 1
+
+    if processed == 0:
+        log_fn("    ⚠ 처리 가능한 시트 없음")
+        return None
+
+    if overwrite:
+        out_path = path
+    else:
+        base, ext = os.path.splitext(os.path.basename(path))
+        out_path = os.path.join(output_dir, f"{base}_초기화{ext}")
+    wb.save(out_path)
+    log_fn(f"    💾 저장: {os.path.basename(out_path)}")
+    return out_path
 
 
 def fill_sheet(ws, daily_map, log_fn, label, user_start=None, user_end=None,
@@ -663,6 +829,9 @@ class OvertimeInputApp:
         self.opt_attendance  = tk.BooleanVar(value=True)
         self.opt_restore     = tk.BooleanVar(value=True)
         self.opt_protect     = tk.BooleanVar(value=True)
+        self.clr_reason      = tk.BooleanVar(value=False)
+        self.clr_restore     = tk.BooleanVar(value=True)
+        self.clr_overwrite   = tk.BooleanVar(value=False)
         self.tmpl_normal     = tk.StringVar()
         self.tmpl_secha      = tk.StringVar()
         self.employee_rules  = {}
@@ -731,6 +900,9 @@ class OvertimeInputApp:
         ttk.Radiobutton(r0, text="수정  — 기존 야근현황 파일 수정 (출퇴근 추가 / 수식 복원 / 사유 보호)",
                         variable=self.mode, value='modify',
                         command=self._on_mode_change).pack(anchor='w')
+        ttk.Radiobutton(r0, text="초기화  — 출퇴근 데이터만 한 번에 비우기 (수식·서식·명단 유지)",
+                        variable=self.mode, value='clear',
+                        command=self._on_mode_change).pack(anchor='w')
 
         self._f1 = ttk.LabelFrame(self.root, text="1. 출퇴근 기록부  (.xls / .xlsx)")
         self._f1.pack(fill='x', **pad)
@@ -774,6 +946,19 @@ class OvertimeInputApp:
         ttk.Checkbutton(rb, text="사유 입력 보호  (휴가·출장 등 텍스트 셀 건드리지 않음)",
                         variable=self.opt_protect).pack(anchor='w')
 
+        self.f3c = ttk.LabelFrame(self.root, text="3. 초기화 옵션")
+        rc = tk.Frame(self.f3c); rc.pack(fill='x', padx=8, pady=6)
+        ttk.Checkbutton(rc, text="야근 계산 수식 자동 복원  (같은 시트의 온전한 행에서 복사)",
+                        variable=self.clr_restore).pack(anchor='w')
+        ttk.Checkbutton(rc, text="사유 텍스트도 삭제  (휴가·출장 등 한글 입력까지 비움)",
+                        variable=self.clr_reason).pack(anchor='w')
+        ttk.Checkbutton(rc, text="원본 파일에 덮어쓰기  (해제 시 '_초기화' 사본 저장)",
+                        variable=self.clr_overwrite,
+                        command=self._on_clr_change).pack(anchor='w')
+        tk.Label(self.f3c,
+                 text="※ 출퇴근 시간만 비웁니다. 직원 명단·설정·공휴일·수식·서식은 그대로 유지됩니다.",
+                 font=('맑은 고딕', 8), fg='gray').pack(anchor='w', padx=12, pady=(0, 4))
+
         self.f4 = ttk.LabelFrame(self.root, text="4. 처리 기간 (선택)  — 비워두면 책정기간 전체 자동 사용")
         self.f4.pack(fill='x', **pad)
         r4 = tk.Frame(self.f4); r4.pack(fill='x', padx=8, pady=6)
@@ -786,6 +971,7 @@ class OvertimeInputApp:
                  font=('맑은 고딕', 8), fg='gray').pack(anchor='w', padx=12, pady=(0, 4))
 
         f5 = ttk.LabelFrame(self.root, text="5. 결과 저장 폴더")
+        self.f5 = f5
         f5.pack(fill='x', **pad)
         r5 = tk.Frame(f5); r5.pack(fill='x', padx=8, pady=6)
         ttk.Entry(r5, textvariable=self.output_dir).pack(side='left', fill='x', expand=True, padx=(0, 8))
@@ -848,13 +1034,37 @@ class OvertimeInputApp:
         mode = self.mode.get()
         self.f3a.pack_forget()
         self.f3b.pack_forget()
+        self.f3c.pack_forget()
+
+        if mode == 'clear':
+            # 초기화는 출퇴근 기록부와 처리 기간이 필요 없다 — 화면에서 숨긴다.
+            self._f1.pack_forget()
+            self.f4.pack_forget()
+            self.f3c.pack(fill='x', padx=12, pady=5, before=self.f5)
+            self._f2.config(text="2. 초기화할 야근현황 파일  (.xlsx)  *필수")
+            self.run_btn.config(text="▶  초 기 화  실 행", bg='#b45309')
+            self._on_clr_change()
+            return
+
+        self._f1.pack(fill='x', padx=12, pady=5, before=self._f2)
+        self.f4.pack(fill='x', padx=12, pady=5, before=self.f5)
+        self.run_btn.config(text="▶  일 괄  실 행", bg='#2563eb')
+        self.f5.config(text="5. 결과 저장 폴더")
+
         if mode == 'new':
             self.f3a.pack(fill='x', padx=12, pady=5, before=self.f4)
             self._f1.config(text="1. 출퇴근 기록부  (.xls / .xlsx)  *필수")
             self._f2.config(text="2. 전달 양식 파일  (.xlsx — 명단 추출 + 수식 소스)")
         else:
             self.f3b.pack(fill='x', padx=12, pady=5, before=self.f4)
+            self._f2.config(text="2. 양식 파일  (.xlsx)")
             self._on_opt_change()
+
+    def _on_clr_change(self):
+        self.f5.config(
+            text="5. 결과 저장 폴더  (덮어쓰기 선택됨 — 사용하지 않음)"
+            if self.clr_overwrite.get() else "5. 결과 저장 폴더"
+        )
 
     def _on_opt_change(self):
         need_att = self.opt_attendance.get()
@@ -1024,11 +1234,16 @@ class OvertimeInputApp:
 
     def run(self):
         mode = self.mode.get()
-        if not self.output_dir.get():
-            messagebox.showwarning("입력 필요", "저장 폴더를 선택하세요.")
-            return
         if not self.form_paths:
             messagebox.showwarning("입력 필요", "양식/대상 파일을 1개 이상 추가하세요.")
+            return
+
+        if mode == 'clear':
+            self._run_clear()
+            return
+
+        if not self.output_dir.get():
+            messagebox.showwarning("입력 필요", "저장 폴더를 선택하세요.")
             return
 
         try:
@@ -1075,6 +1290,85 @@ class OvertimeInputApp:
                       self.tmpl_normal.get(), self.tmpl_secha.get(),
                       dict(self.employee_rules)),
                 daemon=True).start()
+
+    def _run_clear(self):
+        overwrite = self.clr_overwrite.get()
+        outdir = self.output_dir.get()
+
+        if not overwrite and not outdir:
+            messagebox.showwarning("입력 필요", "저장 폴더를 선택하거나 '원본 덮어쓰기'를 선택하세요.")
+            return
+
+        names = "\n".join(f"  · {os.path.basename(p)}" for p in self.form_paths[:10])
+        more = f"\n  ... 외 {len(self.form_paths) - 10}개" if len(self.form_paths) > 10 else ""
+        extra = "사유 텍스트까지 삭제합니다." if self.clr_reason.get() else "사유 텍스트는 보존합니다."
+
+        if overwrite:
+            msg = (f"아래 {len(self.form_paths)}개 파일의 출퇴근 데이터를 지우고\n"
+                   f"원본 파일에 그대로 덮어씁니다. 되돌릴 수 없습니다.\n\n"
+                   f"{names}{more}\n\n{extra}\n\n계속하시겠습니까?")
+        else:
+            msg = (f"아래 {len(self.form_paths)}개 파일의 출퇴근 데이터를 지워\n"
+                   f"'_초기화' 사본으로 저장합니다.\n\n"
+                   f"{names}{more}\n\n{extra}\n\n계속하시겠습니까?")
+
+        if not messagebox.askyesno("출퇴근 데이터 초기화", msg, parent=self.root):
+            return
+
+        self.log.delete('1.0', 'end')
+        self.run_btn.config(state='disabled', text="초기화 중...")
+        threading.Thread(
+            target=self._worker_clear,
+            args=(self.form_paths[:], outdir, self.clr_reason.get(),
+                  self.clr_restore.get(), overwrite,
+                  dict(self.employee_rules)),
+            daemon=True).start()
+
+    def _worker_clear(self, forms, outdir, clear_reason, do_restore, overwrite,
+                      employee_rules):
+        try:
+            self._log("[초기화 모드]")
+            opts = ["수식 자동 복원" if do_restore else "수식 복원 안 함",
+                    "사유 텍스트 삭제" if clear_reason else "사유 텍스트 보존",
+                    "원본 덮어쓰기" if overwrite else "사본 저장"]
+            self._log(f"옵션: {' / '.join(opts)}")
+            self._log(f"\n[대상 파일 {len(forms)}개 처리...]")
+
+            saved, failed = [], []
+            for fp in forms:
+                try:
+                    r = process_clear_file(
+                        fp, outdir, self._log,
+                        clear_reason=clear_reason,
+                        do_restore=do_restore,
+                        overwrite=overwrite,
+                        employee_rules=employee_rules)
+                    if r:
+                        saved.append(r)
+                    else:
+                        failed.append(os.path.basename(fp))
+                except PermissionError:
+                    self._log(f"    ❌ 파일이 열려 있어 저장할 수 없습니다 — Excel에서 닫고 다시 실행하세요")
+                    failed.append(os.path.basename(fp))
+                except Exception as e:
+                    self._log(f"    ❌ 처리 실패: {e}")
+                    failed.append(os.path.basename(fp))
+
+            self._log(f"\n{'='*50}")
+            self._log(f"✅ 초기화 완료 — 저장 {len(saved)}개, 실패 {len(failed)}개")
+            for f in saved:
+                self._log(f"   {os.path.basename(f)}")
+
+            where = "원본 파일에 덮어썼습니다." if overwrite else f"저장 폴더:\n{outdir}"
+            tail = f"\n\n실패 {len(failed)}개: {', '.join(failed)}" if failed else ""
+            self.root.after(0, lambda: messagebox.showinfo(
+                "완료", f"출퇴근 데이터 초기화가 끝났습니다.\n\n{where}{tail}"))
+        except Exception as e:
+            self._log(f"\n❌ 오류:\n{traceback.format_exc()}")
+            self.root.after(0, lambda: messagebox.showerror("오류", str(e)))
+        finally:
+            self.root.after(0, lambda: self.run_btn.config(
+                state='normal', text="▶  초 기 화  실 행"))
 
     def _worker_new(self, att, forms, outdir, user_start, user_end, ty, tm):
         try:

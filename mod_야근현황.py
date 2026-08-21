@@ -862,7 +862,8 @@ def clear_attendance_cells(ws, date_start_col, num_slots, clear_reason=False):
 
 
 def process_clear_file(path, output_dir, log_fn, clear_reason=False,
-                       do_restore=True, overwrite=False, employee_rules=None):
+                       do_restore=True, overwrite=False, employee_rules=None,
+                       do_print_fix=False):
     log_fn(f"\n▶ 초기화: {os.path.basename(path)}")
     wb = load_workbook(path)
     processed = 0
@@ -891,6 +892,9 @@ def process_clear_file(path, output_dir, log_fn, clear_reason=False,
                 log_fn(f"    [{sheet_name}]   └ 야근 계산 수식 복원 {n}셀 (기준 행 {donor})")
             elif cs:
                 log_fn(f"    [{sheet_name}]   ⚠ 수식 복원 실패 — 시트에 온전한 수식 행이 없음")
+
+        if do_print_fix:
+            improve_print_legibility(ws, dsc, num_slots, log_fn, sheet_name)
 
         processed += 1
 
@@ -990,7 +994,7 @@ def process_modify_file(target_path, daily_map, output_dir, log_fn,
                         user_start=None, user_end=None,
                         employee_rules=None,
                         add_new=False, default_pogwal='N', ask_fn=None,
-                        person_meta=None):
+                        person_meta=None, do_print_fix=False):
     log_fn(f"\n▶ 수정: {os.path.basename(target_path)}")
     wb = load_workbook(target_path)
     processed = 0
@@ -1034,6 +1038,10 @@ def process_modify_file(target_path, daily_map, output_dir, log_fn,
             else:
                 log_fn(f"    [{sheet_name}] ⚠ 지정 기간이 책정기간과 겹치지 않음")
 
+        if do_print_fix:
+            improve_print_legibility(ws, date_start_col,
+                                     count_day_slots(ws, date_start_col),
+                                     log_fn, sheet_name)
         processed += 1
 
     if processed == 0:
@@ -1062,7 +1070,7 @@ def process_form_file(form_path, daily_map, output_dir, log_fn,
                        target_year=None, target_month=None,
                        employee_rules=None,
                        add_new=False, default_pogwal='N', ask_fn=None,
-                       person_meta=None):
+                       person_meta=None, do_print_fix=False):
     log_fn(f"\n▶ 양식: {os.path.basename(form_path)}")
     wb = load_workbook(form_path)
     processed = 0
@@ -1104,6 +1112,10 @@ def process_form_file(form_path, daily_map, output_dir, log_fn,
 
         fill_sheet(ws, daily_map, log_fn, sheet_name, user_start, user_end)
         update_print_area(ws, log_fn, sheet_name)
+        if do_print_fix:
+            _, dsc_p = detect_form_layout(ws)
+            improve_print_legibility(ws, dsc_p, count_day_slots(ws, dsc_p),
+                                     log_fn, sheet_name)
         processed += 1
 
     if processed == 0:
@@ -1137,7 +1149,8 @@ def process_all(attendance_paths, form_paths, output_dir, log_fn,
                 user_start=None, user_end=None,
                 target_year=None, target_month=None,
                 employee_rules=None,
-                add_new=False, default_pogwal='N', ask_fn=None):
+                add_new=False, default_pogwal='N', ask_fn=None,
+                do_print_fix=False):
     new_mode = target_year is not None and target_month is not None
 
     log_fn(f"[1/2] 출퇴근 파일 {len(attendance_paths)}개 로딩 (형식 자동 감지)...")
@@ -1168,7 +1181,7 @@ def process_all(attendance_paths, form_paths, output_dir, log_fn,
             r = process_form_file(fp, daily_map, output_dir, log_fn,
                                    user_start, user_end, target_year, target_month,
                                    employee_rules, add_new, default_pogwal, ask_fn,
-                                   person_meta)
+                                   person_meta, do_print_fix)
             if r: saved.append(r)
         except Exception as e:
             log_fn(f"    ❌ 처리 실패: {e}")
@@ -1324,6 +1337,7 @@ class OvertimeInputApp:
         self.clr_reason      = tk.BooleanVar(value=False)
         self.clr_restore     = tk.BooleanVar(value=True)
         self.clr_overwrite   = tk.BooleanVar(value=False)
+        self.opt_printfix    = tk.BooleanVar(value=True)
         self.opt_addnew      = tk.BooleanVar(value=True)
         self.opt_pogwal      = tk.StringVar(value='N')
         self.tmpl_normal     = tk.StringVar()
@@ -1429,6 +1443,7 @@ class OvertimeInputApp:
                  text="※ 처리 범위는 지정 월 책정기간(전월21일~당월20일) 자동 설정",
                  font=('맑은 고딕', 8), fg='gray').pack(anchor='w', padx=12, pady=(0, 4))
         self._make_addnew_row(self.f3a)
+        self._make_printfix_row(self.f3a)
 
         self.f3b = ttk.LabelFrame(self.root, text="3. 수정 옵션")
         rb = tk.Frame(self.f3b); rb.pack(fill='x', padx=8, pady=6)
@@ -1441,6 +1456,7 @@ class OvertimeInputApp:
         ttk.Checkbutton(rb, text="사유 입력 보호  (휴가·출장 등 텍스트 셀 건드리지 않음)",
                         variable=self.opt_protect).pack(anchor='w')
         self._make_addnew_row(self.f3b)
+        self._make_printfix_row(self.f3b)
 
         self.f3c = ttk.LabelFrame(self.root, text="3. 초기화 옵션")
         rc = tk.Frame(self.f3c); rc.pack(fill='x', padx=8, pady=6)
@@ -1453,7 +1469,8 @@ class OvertimeInputApp:
                         command=self._on_clr_change).pack(anchor='w')
         tk.Label(self.f3c,
                  text="※ 출퇴근 시간만 비웁니다. 직원 명단·설정·공휴일·수식·서식은 그대로 유지됩니다.",
-                 font=('맑은 고딕', 8), fg='gray').pack(anchor='w', padx=12, pady=(0, 4))
+                 font=('맑은 고딕', 8), fg='gray', justify='left').pack(anchor='w', padx=12, pady=(0, 4))
+        self._make_printfix_row(self.f3c)
 
         self.f4 = ttk.LabelFrame(self.root, text="4. 처리 기간 (선택)  — 비워두면 책정기간 전체 자동 사용")
         self.f4.pack(fill='x', **pad)
@@ -1555,6 +1572,27 @@ class OvertimeInputApp:
             self.f3b.pack(fill='x', padx=12, pady=5, before=self.f4)
             self._f2.config(text="2. 양식 파일  (.xlsx)")
             self._on_opt_change()
+
+    def _make_printfix_row(self, parent):
+        """인쇄 가독성 개선 옵션 (세 모드 공통).
+
+        수식 복원 템플릿은 수식만 복사하므로 열 너비·글자색·인쇄 영역은
+        템플릿을 지정해도 따라오지 않는다. 그래서 처리하는 모든 모드에서
+        직접 적용해야 한다.
+        """
+        box = tk.Frame(parent)
+        box.pack(fill='x', padx=8, pady=(2, 6))
+        ttk.Checkbutton(
+            box,
+            text="인쇄 가독성 개선  (날짜 열 폭 축소 → 축소 배율 상승, 흐린 글자·테두리 보정)",
+            variable=self.opt_printfix,
+        ).pack(anchor='w')
+        tk.Label(
+            box,
+            text="※ A4 가로 1장 기준으로 배율이 약 24% → 34% 로 올라갑니다.\n"
+                 "※ 이미 적용된 파일은 그대로 둡니다 (여러 번 실행해도 안전).",
+            font=('맑은 고딕', 8), fg='gray', justify='left',
+        ).pack(anchor='w', padx=20, pady=(2, 0))
 
     def _make_addnew_row(self, parent):
         """신규 입사자 자동 추가 옵션 (새 양식 생성 / 수정 모드 공통)."""
@@ -1815,7 +1853,8 @@ class OvertimeInputApp:
                 target=self._worker_new,
                 args=(self.attendance_paths[:], self.form_paths[:],
                       self.output_dir.get(), user_start, user_end, ty, tm,
-                      self.opt_addnew.get(), self.opt_pogwal.get()),
+                      self.opt_addnew.get(), self.opt_pogwal.get(),
+                      self.opt_printfix.get()),
                 daemon=True).start()
         else:
             do_att  = self.opt_attendance.get()
@@ -1835,7 +1874,8 @@ class OvertimeInputApp:
                       do_att, do_res, do_pro,
                       self.tmpl_normal.get(), self.tmpl_secha.get(),
                       dict(self.employee_rules),
-                      self.opt_addnew.get(), self.opt_pogwal.get()),
+                      self.opt_addnew.get(), self.opt_pogwal.get(),
+                      self.opt_printfix.get()),
                 daemon=True).start()
 
     def _run_clear(self):
@@ -1868,15 +1908,16 @@ class OvertimeInputApp:
             target=self._worker_clear,
             args=(self.form_paths[:], outdir, self.clr_reason.get(),
                   self.clr_restore.get(), overwrite,
-                  dict(self.employee_rules)),
+                  dict(self.employee_rules), self.clr_print.get()),
             daemon=True).start()
 
     def _worker_clear(self, forms, outdir, clear_reason, do_restore, overwrite,
-                      employee_rules):
+                      employee_rules, do_print_fix=False):
         try:
             self._log("[초기화 모드]")
             opts = ["수식 자동 복원" if do_restore else "수식 복원 안 함",
                     "사유 텍스트 삭제" if clear_reason else "사유 텍스트 보존",
+                    "인쇄 가독성 개선" if do_print_fix else "인쇄 설정 유지",
                     "원본 덮어쓰기" if overwrite else "사본 저장"]
             self._log(f"옵션: {' / '.join(opts)}")
             self._log(f"\n[대상 파일 {len(forms)}개 처리...]")
@@ -1889,7 +1930,8 @@ class OvertimeInputApp:
                         clear_reason=clear_reason,
                         do_restore=do_restore,
                         overwrite=overwrite,
-                        employee_rules=employee_rules)
+                        employee_rules=employee_rules,
+                        do_print_fix=do_print_fix)
                     if r:
                         saved.append(r)
                     else:
@@ -1918,11 +1960,11 @@ class OvertimeInputApp:
                 state='normal', text="▶  초 기 화  실 행"))
 
     def _worker_new(self, att, forms, outdir, user_start, user_end, ty, tm,
-                    add_new=False, default_pogwal='N'):
+                    add_new=False, default_pogwal='N', do_print_fix=False):
         try:
             process_all(att, forms, outdir, self._log, user_start, user_end, ty, tm,
                         self.employee_rules, add_new, default_pogwal,
-                        self._ask_names)
+                        self._ask_names, do_print_fix)
             self.root.after(0, lambda: messagebox.showinfo(
                 "완료", f"새 양식 생성이 완료되었습니다.\n\n저장 폴더:\n{outdir}"))
         except Exception as e:
@@ -1934,7 +1976,8 @@ class OvertimeInputApp:
 
     def _worker_modify(self, att, forms, outdir, user_start, user_end,
                        do_att, do_res, do_pro, tmpl_normal, tmpl_secha,
-                       employee_rules, add_new=False, default_pogwal='N'):
+                       employee_rules, add_new=False, default_pogwal='N',
+                       do_print_fix=False):
         try:
             self._log("[수정 모드]")
             opts = []
@@ -1944,6 +1987,7 @@ class OvertimeInputApp:
             if do_att:
                 opts.append(f"명단 추가 선택(포괄임금 {default_pogwal})"
                             if add_new else "명단 추가 없음(경고만)")
+            opts.append("인쇄 가독성 개선" if do_print_fix else "인쇄 설정 유지")
             self._log(f"옵션: {' / '.join(opts)}")
 
             daily_map, person_meta = {}, {}
@@ -1967,7 +2011,7 @@ class OvertimeInputApp:
                         tmpl_normal, tmpl_secha,
                         user_start, user_end,
                         employee_rules, add_new, default_pogwal,
-                        self._ask_names, person_meta)
+                        self._ask_names, person_meta, do_print_fix)
                     if r: saved.append(r)
                 except Exception as e:
                     self._log(f"    ❌ 처리 실패: {e}")

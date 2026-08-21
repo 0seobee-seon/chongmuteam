@@ -2,6 +2,9 @@
 총무팀 자동화 허브
 """
 
+import os
+import re
+import sys
 import tkinter as tk
 from tkinter import messagebox
 
@@ -95,6 +98,20 @@ PROGRAMS = [
         "category": "재무·경비",
     },
 ]
+
+def build_stamp():
+    """빌드 날짜. exe 파일명 끝에 붙은 YYYYMMDD 를 읽어 표시한다.
+
+    빌드.bat 이 '총무팀_자동화_허브_20260821.exe' 처럼 날짜를 붙이므로,
+    따로 버전 파일을 두지 않고 실행 파일명에서 그대로 가져온다.
+    """
+    if not getattr(sys, 'frozen', False):
+        return "개발 모드"
+    m = re.search(r'(20\d{2})(\d{2})(\d{2})', os.path.basename(sys.executable))
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return None
+
 
 _open_windows = {}
 
@@ -217,9 +234,13 @@ class HubApp:
         footer = tk.Frame(self.root, bg="#F0F0F0", height=32)
         footer.pack(fill="x", side="bottom")
         footer.pack_propagate(False)
+        stamp = build_stamp()
+        caption = "선엔지니어링종합건축사사무소 총무팀"
+        if stamp:
+            caption += f"     ·     버전 {stamp}"
         tk.Label(
             footer,
-            text="선엔지니어링종합건축사사무소 총무팀",
+            text=caption,
             font=("맑은 고딕", 9),
             bg="#F0F0F0", fg="#888",
         ).pack(expand=True)

@@ -18,6 +18,9 @@ __pycache__/
 # 테스트 데이터 (실제 업무 파일)
 docs/
 
+# 프로그램이 실행 중 만드는 설정 (사용자별 경로가 담김)
+overtime_config.json
+
 # IDE
 .vscode/
 .idea/

@@ -628,6 +628,101 @@ def handle_unlisted(ws, daily_map, date_start_col, form_start, form_end,
     return added
 
 
+# ── 인쇄 가독성 개선 ──────────────────────────────────────────────────
+# 양식은 fitToPage(1페이지 폭)로 인쇄된다. 날짜 열 62개가 기본 너비(8.43)를
+# 쓰는 탓에 전체 폭이 640자폭까지 늘어나, A4 가로 가용폭(808pt)에 맞추려면
+# 24%까지 축소된다. 12pt 글자가 약 2.9pt로 인쇄돼 흐릿해진다.
+# 날짜 열을 실제 내용('08:30' 5자)에 맞게 좁히고 인쇄 영역에서 도우미 열을
+# 빼면 배율이 34%로 올라간다.
+DATE_COL_WIDTH = 6.0        # '08:30' (돋움 12pt Bold) 이 들어가는 최소 폭
+FAINT_FONT = 'FF606060'     # 야근시간 칸의 회색 — 인쇄 시 흐림
+FAINT_BORDER = 'FFB4B4B4'   # 연회색 테두리 — 인쇄 시 거의 안 보임
+DARK_BORDER = 'FF808080'
+
+
+def improve_print_legibility(ws, date_start_col, num_slots, log_fn=None, label='',
+                             col_width=DATE_COL_WIDTH,
+                             font_color='FF000000',
+                             border_color=DARK_BORDER,
+                             drop_helper_cols=True):
+    """인쇄가 흐린 원인을 걷어낸다.
+
+    1) 날짜 열 너비를 내용에 맞게 좁혀 축소 배율을 끌어올린다
+    2) 인쇄 영역에서 요약열 뒤의 도우미 열('📌 이 시트 추가 휴일')을 뺀다
+    3) 야근시간 칸의 회색 글자를 진하게
+    4) 연회색 테두리를 진하게
+    """
+    from openpyxl.styles import Border, Side, Font
+    from openpyxl.utils import get_column_letter, column_index_from_string
+
+    stat = {'width': 0, 'font': 0, 'border': 0, 'area': None}
+
+    # 1) 날짜 열 너비
+    for i in range(num_slots):
+        for c in (date_start_col + 2 * i, date_start_col + 2 * i + 1):
+            dim = ws.column_dimensions[get_column_letter(c)]
+            if dim.width is None or dim.width > col_width:
+                dim.width = col_width
+                stat['width'] += 1
+
+    # 2) 인쇄 영역: 마지막 요약열까지만. 도우미 열은 뺀다.
+    if drop_helper_cols:
+        area = str(ws.print_area or '')
+        mt = re.search(r'\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)', area)
+        if mt:
+            last_content = date_start_col + 2 * num_slots - 1
+            # 요약열(3행에 제목이 있는 열)을 계속 이어붙인다
+            c = last_content + 1
+            while c <= ws.max_column and ws.cell(3, c).value not in (None, ''):
+                v = str(ws.cell(3, c).value)
+                if '📌' in v or '추가 휴일' in v:
+                    break
+                last_content = c
+                c += 1
+            end_col = get_column_letter(last_content)
+            if end_col != mt.group(3):
+                ws.print_area = f"{mt.group(1)}{mt.group(2)}:{end_col}{mt.group(4)}"
+                stat['area'] = f"{mt.group(3)} → {end_col}"
+
+    # 3) 4) 글자색 · 테두리색
+    max_r = ws.max_row
+    max_c = ws.max_column
+    for r in range(1, max_r + 1):
+        for c in range(1, max_c + 1):
+            cell = ws.cell(r, c)
+
+            f = cell.font
+            if f and f.color is not None and getattr(f.color, 'rgb', None) == FAINT_FONT:
+                cell.font = Font(name=f.name, sz=f.sz, b=f.b, i=f.i, u=f.u,
+                                 strike=f.strike, vertAlign=f.vertAlign,
+                                 color=font_color)
+                stat['font'] += 1
+
+            bd = cell.border
+            if bd is None:
+                continue
+            changed = False
+            sides = {}
+            for nm in ('left', 'right', 'top', 'bottom'):
+                s = getattr(bd, nm)
+                if s is not None and s.style and getattr(s.color, 'rgb', None) == FAINT_BORDER:
+                    sides[nm] = Side(style=s.style, color=border_color)
+                    changed = True
+                else:
+                    sides[nm] = s
+            if changed:
+                cell.border = Border(diagonal=bd.diagonal,
+                                     diagonalUp=bd.diagonalUp,
+                                     diagonalDown=bd.diagonalDown, **sides)
+                stat['border'] += 1
+
+    if log_fn:
+        log_fn(f"    [{label}]   └ 인쇄 가독성: 날짜열 {stat['width']}개 폭 {col_width}, "
+               f"흐린 글자 {stat['font']}셀, 연한 테두리 {stat['border']}셀 보정"
+               + (f", 인쇄영역 {stat['area']}" if stat['area'] else ""))
+    return stat
+
+
 def update_print_area(ws, log_fn=None, label=''):
     """인쇄 영역의 마지막 행을 실제 명단 끝에 맞춘다.
 

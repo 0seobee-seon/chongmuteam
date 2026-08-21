@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import json
+import difflib
 import threading
 import traceback
 from datetime import datetime, date, timedelta
@@ -16,6 +17,7 @@ from pathlib import Path
 try:
     import pandas as pd
     from openpyxl import load_workbook
+    from openpyxl.styles import PatternFill
 except ImportError as _e:
     import tkinter as _tk
     from tkinter import messagebox as _mb
@@ -358,6 +360,136 @@ def clear_period_cells(ws, date_start_col, form_start, eff_start, eff_end,
                     cell.value = None
 
 
+# ── 신규 입사자 명단 자동 추가 ────────────────────────────────────────
+# 출퇴근 기록에는 있으나 양식 명단에 없는 직원은 조회 대상이 아니어서
+# 근무기록이 조용히 누락된다. 빈 슬롯에 이름을 넣어 이를 막는다.
+NEW_EMP_FILL = PatternFill('solid', fgColor='FFF2CC')   # 신규 추가 — 검토 필요
+SIMILAR_FILL = PatternFill('solid', fgColor='F8CBAD')   # 기존 이름과 유사 — 오탈자 확인
+
+# 한글 3자 이름에서 한 글자만 다르면 유사도가 약 0.67이다. 이 수준을 잡아내되,
+# 김영수/김영준처럼 실제로 다른 사람도 같은 값이 나오므로 추가를 막지는 않고
+# 색과 로그로 강하게 표시만 한다. 막으면 진짜 신입의 기록을 잃는다.
+SIMILAR_CUTOFF = 0.6
+
+
+def _find_header_col(ws, keyword, max_col=40):
+    for c in range(1, max_col + 1):
+        v = ws.cell(3, c).value
+        if isinstance(v, str) and keyword in v.replace(' ', '').replace('\n', ''):
+            return c
+    return None
+
+
+def _roster_map(ws):
+    """양식에 이미 있는 {정규화된 이름: 성명행}."""
+    out = {}
+    for row in range(7, 200, 2):
+        nm = ws.cell(row, 3).value
+        if nm:
+            out[str(nm).replace(' ', '')] = row
+    return out
+
+
+def find_empty_slots(ws, date_start_col):
+    """이름이 비어 있고 야근 계산 수식이 살아있는 성명행."""
+    return [r for r in range(7, 200, 2)
+            if not ws.cell(r, 3).value
+            and _is_formula(ws.cell(r, date_start_col).value)]
+
+
+def add_missing_employees(ws, daily_map, date_start_col, form_start, form_end,
+                          log_fn, label, default_pogwal='N'):
+    """기록에만 있는 직원을 빈 슬롯에 추가한다.
+
+    반환: (추가된 [(이름, 행, 일수, 유사후보)], 자리부족 [(이름, 일수)])
+
+    빈 슬롯에는 이전 명단의 포괄임금 값이 남아 있으므로(예: D25='Y'),
+    이름만 넣으면 신입이 남의 설정을 물려받는다. 반드시 명시적으로 덮어쓴다.
+    """
+    roster = _roster_map(ws)
+
+    # 책정기간 안에 기록이 있는 이름만 대상으로 삼는다.
+    counts = {}
+    for (nm, d) in daily_map:
+        if form_start <= d <= form_end:
+            counts.setdefault(nm, []).append(d)
+
+    missing = {nm: sorted(ds) for nm, ds in counts.items() if nm not in roster}
+    if not missing:
+        return [], []
+
+    pogwal_col = _find_header_col(ws, '포괄임금')
+    title_col = _find_header_col(ws, '직책')
+
+    slots = find_empty_slots(ws, date_start_col)
+    added, no_slot = [], []
+    base_roster = list(roster)
+
+    # 기록이 많은 사람 먼저 (실재 가능성이 높은 순)
+    for nm in sorted(missing, key=lambda n: (-len(missing[n]), n)):
+        days = missing[nm]
+        if not slots:
+            no_slot.append((nm, len(days)))
+            continue
+
+        near = difflib.get_close_matches(nm, base_roster, n=3, cutoff=SIMILAR_CUTOFF)
+        fill = SIMILAR_FILL if near else NEW_EMP_FILL
+
+        row = slots.pop(0)
+        c = ws.cell(row, 3)
+        c.value = nm
+        c.fill = fill
+        if pogwal_col:
+            pc = ws.cell(row, pogwal_col)
+            pc.value = default_pogwal     # 이전 명단 잔여값을 반드시 덮어쓴다
+            pc.fill = fill
+        if title_col:
+            tc = ws.cell(row, title_col)
+            tc.value = None               # 직책은 추론 불가 — 비우고 표시만
+            tc.fill = fill
+        added.append((nm, row, len(days), near))
+
+    if added:
+        log_fn(f"    [{label}]   └ 신규 직원 {len(added)}명 명단 추가 "
+               f"(포괄임금={default_pogwal})")
+        for nm, row, n, near in added:
+            tag = f"   ⚠ 기존 명단과 유사: {near} — 오탈자인지 확인" if near else ""
+            log_fn(f"        + {nm}  {row}행  기록 {n}일분{tag}")
+        if title_col:
+            log_fn(f"        ※ 직책은 비어 있습니다 — 확인 후 직접 입력하세요")
+        sim = [a for a in added if a[3]]
+        if sim:
+            log_fn(f"        ※ 주황색 {len(sim)}명은 기존 이름과 비슷합니다. "
+                   f"오탈자면 해당 행을 지우세요")
+    if no_slot:
+        log_fn(f"    [{label}]   ❌ 빈 슬롯이 없어 추가하지 못함 {len(no_slot)}명:")
+        for nm, n in no_slot:
+            log_fn(f"        ! {nm}  기록 {n}일분 — 누락됩니다")
+        log_fn(f"        → 양식에 직원 칸을 늘리거나 이름을 직접 넣으세요")
+
+    return added, no_slot
+
+
+def report_unlisted_employees(ws, daily_map, form_start, form_end, log_fn, label):
+    """자동 추가를 쓰지 않을 때, 누락되는 직원만 경고한다."""
+    roster = _roster_map(ws)
+    counts = {}
+    for (nm, d) in daily_map:
+        if form_start <= d <= form_end:
+            counts.setdefault(nm, []).append(d)
+    missing = {nm: sorted(ds) for nm, ds in counts.items() if nm not in roster}
+    if not missing:
+        return []
+    log_fn(f"    [{label}]   ⚠ 양식에 없는 직원 {len(missing)}명 — "
+           f"이 기록은 입력되지 않았습니다:")
+    for nm in sorted(missing, key=lambda n: (-len(missing[n]), n)):
+        ds = missing[nm]
+        log_fn(f"        • {nm}  기록 {len(ds)}일분 "
+               f"({ds[0]:%m-%d} ~ {ds[-1]:%m-%d})")
+    log_fn(f"        → 양식 C열 빈 슬롯에 이름을 추가한 뒤 다시 실행하세요")
+    return sorted(missing)
+
+
 # ── 출퇴근 데이터 초기화 ──────────────────────────────────────────────
 # 양식의 일자 칸은 하루당 2열(출근/퇴근)이며, 책정기간이 30일인 달에도
 # 31일치 칸이 만들어져 있다. 초기화는 책정기간이 아니라 '시트에 실재하는
@@ -593,7 +725,8 @@ def process_modify_file(target_path, daily_map, output_dir, log_fn,
                         do_attendance, do_restore, do_protect,
                         template_normal, template_secha,
                         user_start=None, user_end=None,
-                        employee_rules=None):
+                        employee_rules=None,
+                        add_new=False, default_pogwal='N'):
     log_fn(f"\n▶ 수정: {os.path.basename(target_path)}")
     wb = load_workbook(target_path)
     processed = 0
@@ -626,6 +759,13 @@ def process_modify_file(target_path, daily_map, output_dir, log_fn,
             eff_start = max(form_start, user_start) if user_start else form_start
             eff_end   = min(form_end,   user_end)   if user_end   else form_end
             if eff_start <= eff_end:
+                if add_new:
+                    add_missing_employees(ws, daily_map, date_start_col,
+                                          eff_start, eff_end, log_fn, sheet_name,
+                                          default_pogwal)
+                else:
+                    report_unlisted_employees(ws, daily_map, eff_start, eff_end,
+                                              log_fn, sheet_name)
                 fill_sheet(ws, daily_map, log_fn, sheet_name,
                            user_start, user_end, protect_text=do_protect)
             else:
@@ -657,7 +797,8 @@ def process_modify_file(target_path, daily_map, output_dir, log_fn,
 def process_form_file(form_path, daily_map, output_dir, log_fn,
                        user_start=None, user_end=None,
                        target_year=None, target_month=None,
-                       employee_rules=None):
+                       employee_rules=None,
+                       add_new=False, default_pogwal='N'):
     log_fn(f"\n▶ 양식: {os.path.basename(form_path)}")
     wb = load_workbook(form_path)
     processed = 0
@@ -686,6 +827,17 @@ def process_form_file(form_path, daily_map, output_dir, log_fn,
                                                       employee_rules)
                 if restored:
                     log_fn(f"    [{sheet_name}] 야근 계산 수식 복원: {restored}셀")
+
+        if daily_map:
+            _, dsc_now = detect_form_layout(ws)
+            f_start, f_end = calc_period(ws.cell(2, 2).value,
+                                         ws.cell(2, detect_form_layout(ws)[0]).value)
+            if add_new:
+                add_missing_employees(ws, daily_map, dsc_now, f_start, f_end,
+                                      log_fn, sheet_name, default_pogwal)
+            else:
+                report_unlisted_employees(ws, daily_map, f_start, f_end,
+                                          log_fn, sheet_name)
 
         fill_sheet(ws, daily_map, log_fn, sheet_name, user_start, user_end)
         processed += 1
@@ -720,7 +872,8 @@ def process_form_file(form_path, daily_map, output_dir, log_fn,
 def process_all(attendance_paths, form_paths, output_dir, log_fn,
                 user_start=None, user_end=None,
                 target_year=None, target_month=None,
-                employee_rules=None):
+                employee_rules=None,
+                add_new=False, default_pogwal='N'):
     new_mode = target_year is not None and target_month is not None
 
     log_fn(f"[1/2] 출퇴근 파일 {len(attendance_paths)}개 로딩 (형식 자동 감지)...")
@@ -749,7 +902,7 @@ def process_all(attendance_paths, form_paths, output_dir, log_fn,
         try:
             r = process_form_file(fp, daily_map, output_dir, log_fn,
                                    user_start, user_end, target_year, target_month,
-                                   employee_rules)
+                                   employee_rules, add_new, default_pogwal)
             if r: saved.append(r)
         except Exception as e:
             log_fn(f"    ❌ 처리 실패: {e}")
@@ -832,6 +985,8 @@ class OvertimeInputApp:
         self.clr_reason      = tk.BooleanVar(value=False)
         self.clr_restore     = tk.BooleanVar(value=True)
         self.clr_overwrite   = tk.BooleanVar(value=False)
+        self.opt_addnew      = tk.BooleanVar(value=True)
+        self.opt_pogwal      = tk.StringVar(value='N')
         self.tmpl_normal     = tk.StringVar()
         self.tmpl_secha      = tk.StringVar()
         self.employee_rules  = {}
@@ -934,6 +1089,7 @@ class OvertimeInputApp:
         tk.Label(self.f3a,
                  text="※ 처리 범위는 지정 월 책정기간(전월21일~당월20일) 자동 설정",
                  font=('맑은 고딕', 8), fg='gray').pack(anchor='w', padx=12, pady=(0, 4))
+        self._make_addnew_row(self.f3a)
 
         self.f3b = ttk.LabelFrame(self.root, text="3. 수정 옵션")
         rb = tk.Frame(self.f3b); rb.pack(fill='x', padx=8, pady=6)
@@ -945,6 +1101,7 @@ class OvertimeInputApp:
                         variable=self.opt_restore).pack(anchor='w')
         ttk.Checkbutton(rb, text="사유 입력 보호  (휴가·출장 등 텍스트 셀 건드리지 않음)",
                         variable=self.opt_protect).pack(anchor='w')
+        self._make_addnew_row(self.f3b)
 
         self.f3c = ttk.LabelFrame(self.root, text="3. 초기화 옵션")
         rc = tk.Frame(self.f3c); rc.pack(fill='x', padx=8, pady=6)
@@ -1059,6 +1216,33 @@ class OvertimeInputApp:
             self.f3b.pack(fill='x', padx=12, pady=5, before=self.f4)
             self._f2.config(text="2. 양식 파일  (.xlsx)")
             self._on_opt_change()
+
+    def _make_addnew_row(self, parent):
+        """신규 입사자 자동 추가 옵션 (새 양식 생성 / 수정 모드 공통)."""
+        box = tk.Frame(parent)
+        box.pack(fill='x', padx=8, pady=(2, 6))
+        ttk.Checkbutton(
+            box,
+            text="양식에 없는 신규 입사자 자동 추가  (빈 슬롯에 이름 기입)",
+            variable=self.opt_addnew,
+        ).pack(anchor='w')
+
+        sub = tk.Frame(box)
+        sub.pack(fill='x', padx=20, pady=(2, 0))
+        tk.Label(sub, text="신규 직원 포괄임금 기본값:",
+                 font=('맑은 고딕', 9)).pack(side='left')
+        ttk.Combobox(sub, textvariable=self.opt_pogwal, values=['N', 'Y'],
+                     width=4, state='readonly').pack(side='left', padx=(4, 8))
+        tk.Label(sub, text="(빈 슬롯에 남은 이전 명단 값을 덮어씁니다)",
+                 font=('맑은 고딕', 8), fg='gray').pack(side='left')
+
+        tk.Label(
+            box,
+            text="※ 추가된 칸은 노란색 — 직책은 비어 있으니 확인 후 입력하세요.\n"
+                 "※ 기존 이름과 비슷하면 주황색 (오탈자면 그 행을 지우세요).\n"
+                 "※ 해제하면 추가 없이 '누락되는 직원' 경고만 표시합니다.",
+            font=('맑은 고딕', 8), fg='gray', justify='left',
+        ).pack(anchor='w', padx=20, pady=(3, 0))
 
     def _on_clr_change(self):
         self.f5.config(
@@ -1269,7 +1453,8 @@ class OvertimeInputApp:
             threading.Thread(
                 target=self._worker_new,
                 args=(self.attendance_paths[:], self.form_paths[:],
-                      self.output_dir.get(), user_start, user_end, ty, tm),
+                      self.output_dir.get(), user_start, user_end, ty, tm,
+                      self.opt_addnew.get(), self.opt_pogwal.get()),
                 daemon=True).start()
         else:
             do_att  = self.opt_attendance.get()
@@ -1288,7 +1473,8 @@ class OvertimeInputApp:
                       self.output_dir.get(), user_start, user_end,
                       do_att, do_res, do_pro,
                       self.tmpl_normal.get(), self.tmpl_secha.get(),
-                      dict(self.employee_rules)),
+                      dict(self.employee_rules),
+                      self.opt_addnew.get(), self.opt_pogwal.get()),
                 daemon=True).start()
 
     def _run_clear(self):
@@ -1370,10 +1556,11 @@ class OvertimeInputApp:
             self.root.after(0, lambda: self.run_btn.config(
                 state='normal', text="▶  초 기 화  실 행"))
 
-    def _worker_new(self, att, forms, outdir, user_start, user_end, ty, tm):
+    def _worker_new(self, att, forms, outdir, user_start, user_end, ty, tm,
+                    add_new=False, default_pogwal='N'):
         try:
             process_all(att, forms, outdir, self._log, user_start, user_end, ty, tm,
-                        self.employee_rules)
+                        self.employee_rules, add_new, default_pogwal)
             self.root.after(0, lambda: messagebox.showinfo(
                 "완료", f"새 양식 생성이 완료되었습니다.\n\n저장 폴더:\n{outdir}"))
         except Exception as e:
@@ -1385,13 +1572,16 @@ class OvertimeInputApp:
 
     def _worker_modify(self, att, forms, outdir, user_start, user_end,
                        do_att, do_res, do_pro, tmpl_normal, tmpl_secha,
-                       employee_rules):
+                       employee_rules, add_new=False, default_pogwal='N'):
         try:
             self._log("[수정 모드]")
             opts = []
             if do_att: opts.append("출퇴근 추가/수정")
             if do_res: opts.append("수식 복원")
             if do_pro: opts.append("사유 보호")
+            if do_att:
+                opts.append(f"신규 자동추가(포괄임금 {default_pogwal})"
+                            if add_new else "신규 경고만")
             self._log(f"옵션: {' / '.join(opts)}")
 
             daily_map = {}
@@ -1413,7 +1603,7 @@ class OvertimeInputApp:
                         do_att, do_res, do_pro,
                         tmpl_normal, tmpl_secha,
                         user_start, user_end,
-                        employee_rules)
+                        employee_rules, add_new, default_pogwal)
                     if r: saved.append(r)
                 except Exception as e:
                     self._log(f"    ❌ 처리 실패: {e}")
